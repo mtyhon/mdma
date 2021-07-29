@@ -58,6 +58,7 @@ def get_default_h() -> argparse.Namespace:
   h_parser.add_argument('--w_bias', type=float, default=1.0)
   h_parser.add_argument('--b_std', type=float, default=0)
   h_parser.add_argument('--b_bias', type=float, default=0)
+  h_parser.add_argument('--min_lr', type=float, default=1e-4)
   h_parser.add_argument('--a_std', type=float, default=1)
 
   # fitting
@@ -314,7 +315,7 @@ def initialize(h):
   scheduler = t.optim.lr_scheduler.ReduceLROnPlateau(optimizer,
                                                      verbose=True,
                                                      patience=h.patience,
-                                                     min_lr=1e-4,
+                                                     min_lr=h.min_lr,
                                                      factor=0.5)
   start_epoch = 0
   use_stable_nll = True
