@@ -369,3 +369,136 @@ def set_adaptive_coupling(h, model, train_loader):
 
   model.create_adaptive_couplings(batches)
   print('Using adaptive variable coupling')
+  
+  
+def fit_mdma_custom(
+    h: argparse.Namespace,
+    data: List[t.utils.data.DataLoader],
+) -> models.MDMA:
+  """ Fit MDMA model to data using stochastic gradient descent on the negative log likelihood.
+
+  Args:
+    h: Argument parser containing training and model hyperparameters.
+    data: List of training, validation and test dataloaders.
+
+  Returns:
+    Fitted MDMA model.
+  """
+
+  n_iters = h.n_epochs * h.M // h.batch_size
+
+  save_path = h.save_path
+  if h.use_tb:
+    tb_path = get_tb_path(h)
+    if not os.path.isdir(tb_path):
+      os.mkdir(tb_path)
+      with open(tb_path + '/h.json', 'w') as f:
+        json.dump(h.__dict__, f, indent=4, sort_keys=True)
+    save_path = tb_path
+    from tensorboardX import SummaryWriter
+    writer = SummaryWriter(tb_path)
+    print('Saving tensorboard logs to ' + tb_path)
+
+  model, optimizer, scheduler, start_epoch, use_stable_nll = initialize(h)
+  model, optimizer, scheduler, start_epoch, use_stable_nll = load_checkpoint(
+      model, optimizer, scheduler, start_epoch, use_stable_nll, save_path)
+
+  total_params = sum(p.numel() for p in model.parameters())
+  print(
+      f"Running {n_iters} iterations. Model contains {total_params} parameters."
+  )
+  h.total_params = total_params
+  print_arguments(h)
+
+  # Set up data loaders
+  train_loader, val_loader, test_loader = data
+
+  t.autograd.set_detect_anomaly(h.set_detect_anomaly)
+
+  # Fit MDMA
+  if h.use_HT and h.adaptive_coupling:
+    set_adaptive_coupling(h, model, train_loader)
+  clip_max_norm = 0
+  step = start_epoch * len(train_loader)
+  inds = ...
+  missing_data_mask = None
+  use_stable_nll = True
+  tic = time.time()
+  es = utils.EarlyStopping(patience=h.es_patience)
+  for epoch in range(start_epoch, h.n_epochs):
+    for batch_idx, batch in enumerate(train_loader):
+      batch_data = batch[:, 0, :].to(device)
+      if h.missing_data_pct > 0:
+        missing_data_mask = batch[:, 1, :].to(device)
+
+      if h.subsample_inds:
+        inds = t.randperm(h.d)[:h.n_inds_to_subsample]
+
+      if step == h.stable_nll_iters:
+        use_stable_nll = False
+
+      for param in model.parameters():
+        param.grad = None
+
+      obj = model.nll(batch_data[:, inds],
+                      inds=inds,
+                      stabilize=use_stable_nll,
+                      missing_data_mask=missing_data_mask)
+      nll_value = obj.item()
+      obj.backward()
+
+      if clip_max_norm > 0:
+        t.nn.utils.clip_grad_value_(model.parameters(), clip_max_norm)
+
+      optimizer.step()
+      if not h.eval_validation:
+        scheduler.step(obj)
+
+      if h.verbose and step % h.print_every == 0:
+
+        print_str = f'Iteration {step}, train nll: {nll_value:.4f}'
+
+        toc = time.time()
+        print_str += f', elapsed: {toc - tic:.4f}, {h.print_every / (toc - tic):.4f} iterations per sec.'
+        tic = time.time()
+        print(print_str)
+
+        if h.use_tb:
+          writer.add_scalar('lr', optimizer.param_groups[0]['lr'], step)
+          writer.add_scalar('loss/train', nll_value, step)
+
+      step += 1
+      if step == h.max_iters:
+        print(f'Terminating after {h.max_iters} iterations.')
+        return model
+
+    if h.save_checkpoints:
+      cp_file = save_path + '/checkpoint.pt'
+      print('Saving model to ' + cp_file)
+      t.save(
+          {
+              'model': model,
+              'optimizer': optimizer.state_dict(),
+              'scheduler': scheduler.state_dict(),
+              'epoch': epoch + 1,
+              'use_stable_nll': use_stable_nll
+          }, cp_file)
+
+    if h.eval_test:
+      test_nll = eval_test(model, test_loader)
+      print(f'Epoch {epoch}, test nll: {test_nll:.4f}')
+      if h.use_tb:
+        writer.add_scalar('loss/test', test_nll, epoch)
+
+    if h.eval_validation:
+      val_nll = eval_validation(model, val_loader, h)
+      scheduler.step(val_nll)
+      print(f'Epoch {epoch}, validation nll: {val_nll:.4f}')
+      if h.use_tb:
+        writer.add_scalar('loss/validation', val_nll, epoch)
+
+      if es.step(val_nll):
+        print('Early stopping criterion met, terminating.')
+        return model
+
+  return model
